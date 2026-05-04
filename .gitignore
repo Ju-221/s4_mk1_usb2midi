@@ -1,0 +1,22 @@
+# Build output
+build/
+bin/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+tools/__pycache__/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# debug usb capture files
+*.pcapng
+*.csv
+
