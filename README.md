@@ -1,4 +1,4 @@
-# S4 MK1 USB to MIDI Bridge
+# S4 MK1 USB to MIDI
 
 [![build](https://github.com/Ju-221/s4_mk1_usb2midi/actions/workflows/build.yml/badge.svg)](https://github.com/Ju-221/s4_mk1_usb2midi/actions/workflows/build.yml)
 
