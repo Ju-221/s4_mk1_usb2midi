@@ -1,4 +1,6 @@
-# S4 MK1 USB → MIDI Bridge
+# S4 MK1 USB to MIDI Bridge
+
+[![build](https://github.com/Ju-221/s4_mk1_usb2midi/actions/workflows/build.yml/badge.svg)](https://github.com/Ju-221/s4_mk1_usb2midi/actions/workflows/build.yml)
 
 A standalone macOS Sonoma 14 (Intel/Apple Silicon) application that bridges the Traktor S4 MK1 USB controller to virtual CoreMIDI ports, letting you use it with any MIDI-capable software (Traktor, Mixxx, Ableton, etc.) without a driver. It behaves like any other generic midi device you connect to your DAW/DJ software and can be remapped as needed.
 
