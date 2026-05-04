@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(s4_mk1_usb2midi LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+# Pin the project language level to C++20 and force cache overrides back to 20.
+set(CMAKE_CXX_STANDARD 20 CACHE STRING "C++ standard" FORCE)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -28,6 +29,7 @@ target_link_libraries(s4_mk1_usb2midi
 )
 
 target_compile_options(s4_mk1_usb2midi PRIVATE
+    -std=c++20
     -Wall
     -Wextra
     -Wpedantic
@@ -49,6 +51,7 @@ add_executable(test_s4_generic_protocol
 
 target_include_directories(test_s4_generic_protocol PRIVATE include)
 target_compile_options(test_s4_generic_protocol PRIVATE
+    -std=c++20
     -Wall
     -Wextra
     -Wpedantic

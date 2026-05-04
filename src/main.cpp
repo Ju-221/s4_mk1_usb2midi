@@ -21,9 +21,7 @@
 using namespace std;
 
 namespace {
-// ---------------------------------------------------------------------------
 // Global state and types
-// ---------------------------------------------------------------------------
 atomic_bool running = true;
 
 enum class Mode {
@@ -45,22 +43,27 @@ struct AppOptions {
     int write_interval_ms = 50;
 };
 
-// ---------------------------------------------------------------------------
+
 // Forward declarations
-// ---------------------------------------------------------------------------
-void handle_signal(int);
-string hex_dump(span<const uint8_t> bytes);
+AppOptions parse_args(int argc, char** argv);
+void print_usage();
+
+
 void print_input_deltas(span<const uint8_t> previous, span<const uint8_t> current, bool buttons_only);
 InputDecodeMode parse_decode_mode(const string& text);
+
 uint16_t parse_u16(const string& text);
 uint8_t parse_u8(const string& text);
 int parse_i32(const string& text);
+
 vector<uint8_t> parse_hex_bytes(const string& text);
-void print_usage();
-AppOptions parse_args(int argc, char** argv);
+
 int run_probe(const AppOptions& options);
 int run_bridge(const AppOptions& options);
-} // namespace
+void handle_signal(int);
+string hex_dump(span<const uint8_t> bytes);
+} 
+
 
 int main(int argc, char** argv) {
     signal(SIGINT, handle_signal);
@@ -85,9 +88,7 @@ int main(int argc, char** argv) {
 }
 
 namespace {
-// ---------------------------------------------------------------------------
 // Implementations
-// ---------------------------------------------------------------------------
 
 void handle_signal(int) {
     running = false;
