@@ -8,9 +8,7 @@
 using namespace std;
 
 namespace {
-// ---------------------------------------------------------------------------
 // Small MIDI helpers
-// ---------------------------------------------------------------------------
 MidiMessage make_cc(uint8_t channel, uint8_t controller, uint8_t value) {
     return MidiMessage{.bytes = {
         static_cast<uint8_t>(0xB0 | (channel & 0x0F)),
@@ -111,6 +109,7 @@ vector<MidiMessage> S4GenericProtocol::decode_input(span<const uint8_t> report) 
     }
 
     const size_t byte_count = min(previous_report_.size(), report.size());
+
     for (size_t byte_index = 0; byte_index < byte_count; ++byte_index) {
         const uint8_t previous = previous_report_[byte_index];
         const uint8_t current = report[byte_index];
@@ -118,6 +117,10 @@ vector<MidiMessage> S4GenericProtocol::decode_input(span<const uint8_t> report) 
             continue;
         }
 
+        // diff:  bitmask of which bits flipped (used by the BIT view below).
+        // >> 1 drops the lowest status bit; & 0x7F clamps to MIDI range (0-127).
+        // delta: absolute movement distance, used to filter out deadzone noise.
+        // raw_value: the current position to send as a MIDI CC value.
         const uint8_t diff = static_cast<uint8_t>(previous ^ current);
         const uint8_t previous_value = static_cast<uint8_t>((previous >> 1) & 0x7F);
         const uint8_t current_value = static_cast<uint8_t>((current >> 1) & 0x7F);
@@ -127,7 +130,9 @@ vector<MidiMessage> S4GenericProtocol::decode_input(span<const uint8_t> report) 
 
         // BYTE view: good for knobs/faders (0-127 value stream)
         if (decode_mode_ == InputDecodeMode::Byte || decode_mode_ == InputDecodeMode::Hybrid) {
+
             bool emitted = false;
+
             if (const auto mapped = find_byte_mapping(byte_index); mapped.has_value()) {
                 const int dz =
                     mapped->deadzone_override >= 0 ? mapped->deadzone_override : static_cast<int>(input_deadzone_);

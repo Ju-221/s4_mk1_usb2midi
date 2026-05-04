@@ -19,6 +19,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from dataclasses import dataclass
 from datetime import datetime
 from tkinter import messagebox, ttk
@@ -29,6 +30,322 @@ import mido
 
 DEFAULT_IN_HINT = "S4 MK1 USB2MIDI"
 DEFAULT_OUT_HINT = "S4 MK1 USB2MIDI Feedback"
+
+# ---------------------------------------------------------------------------
+# ByteMapWindow
+# ---------------------------------------------------------------------------
+# Shows a live hex grid of the raw USB packet bytes.  Two update paths:
+#   • CC-based: reconstructs byte values from incoming MIDI CC messages.
+#   • SysEx-based: decodes the raw-USB SysEx packets emitted when the bridge
+#     is started with --raw-sysex (format F0 7D 53 34 02 <nibbles> F7).
+
+class ByteMapWindow:
+    """Toplevel window: hex grid + bit-breakdown panel for USB packet bytes."""
+
+    COLS = 32
+    MAX_BYTES = 512
+    _FADE_MS = 2000  # highlight duration in ms
+
+    def __init__(self, master: tk.Tk, base_channel_var: tk.IntVar) -> None:
+        self._master = master
+        self._base_ch_var = base_channel_var  # 1-based MIDI channel
+        self._data = bytearray(self.MAX_BYTES)
+        self._changed_at: List[Optional[float]] = [None] * self.MAX_BYTES
+        self._selected_idx: Optional[int] = None
+        self._labels: List[tk.Label] = []
+        self._header_labels: List[tk.Label] = []
+        self._addr_labels: List[tk.Label] = []
+        self._alive = True
+        self._zoom_var = tk.DoubleVar(value=1.0)
+        self._base_font_size = 9
+        self._grid_canvas: Optional[tk.Canvas] = None
+        self._fit_pending = False
+
+        self._win = tk.Toplevel(master)
+        self._win.title("Byte Map — USB packet hex view")
+        self._win.geometry("1600x900")
+        self._win.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._build()
+        self._apply_zoom()
+        self._schedule_auto_fit()
+        self._tick()
+
+    def _build(self) -> None:
+        # ── Toolbar ──────────────────────────────────────────────────────────
+        toolbar = ttk.Frame(self._win, padding=(6, 4))
+        toolbar.pack(fill=tk.X)
+
+        ttk.Button(toolbar, text="Clear Highlights",
+                   command=self._clear_highlights).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(toolbar, text="Source:").pack(side=tk.LEFT)
+        self._src_var = tk.StringVar(value="Both")
+        ttk.Combobox(toolbar, textvariable=self._src_var,
+                     values=["Both", "CC only", "SysEx only"],
+                     width=12, state="readonly").pack(side=tk.LEFT, padx=(2, 12))
+
+        ttk.Label(toolbar, text="MIDI base ch:").pack(side=tk.LEFT)
+        ttk.Spinbox(toolbar, from_=1, to=16, width=4,
+                    textvariable=self._base_ch_var).pack(side=tk.LEFT, padx=(2, 12))
+
+        self._info_var = tk.StringVar(value="Click a cell to inspect bits")
+        ttk.Label(toolbar, textvariable=self._info_var,
+                  foreground="#888888").pack(side=tk.LEFT)
+
+        # ── Main pane: grid left, bit panel right ─────────────────────────
+        paned = ttk.PanedWindow(self._win, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+
+        grid_outer = ttk.Frame(paned)
+        paned.add(grid_outer, weight=5)
+
+        self._bit_frame = ttk.LabelFrame(paned, text="Bit Breakdown", padding=8)
+        paned.add(self._bit_frame, weight=1)
+
+        self._build_grid(grid_outer)
+        self._build_bit_panel()
+
+    # ── Grid ─────────────────────────────────────────────────────────────────
+
+    def _build_grid(self, parent: ttk.Frame) -> None:
+        # Column-index header row
+        header = tk.Frame(parent, bg="#333333")
+        header.pack(fill=tk.X)
+        addr_header = tk.Label(header, text="  Addr ", width=7, bg="#333333", fg="#888888",
+                               font=("Courier", self._base_font_size))
+        addr_header.pack(side=tk.LEFT, padx=1, pady=1)
+        self._header_labels.append(addr_header)
+        for col in range(self.COLS):
+            lbl = tk.Label(header, text=f"{col:02X}", width=3, bg="#333333", fg="#888888",
+                           font=("Courier", self._base_font_size))
+            lbl.pack(side=tk.LEFT, padx=1, pady=1)
+            self._header_labels.append(lbl)
+
+        # Scrollable canvas for the data rows
+        canvas = tk.Canvas(parent, highlightthickness=0, bg="#1e1e1e")
+        self._grid_canvas = canvas
+        vsb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        inner = tk.Frame(canvas, bg="#1e1e1e")
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<MouseWheel>",
+                    lambda e: canvas.yview_scroll(int(-1 * e.delta / 120), "units"))
+        canvas.bind("<Configure>", self._on_canvas_resize)
+
+        rows = (self.MAX_BYTES + self.COLS - 1) // self.COLS
+        for row in range(rows):
+            addr = row * self.COLS
+            row_frame = tk.Frame(inner, bg="#1e1e1e")
+            row_frame.pack(fill=tk.X)
+            addr_lbl = tk.Label(row_frame, text=f"0x{addr:03X}", width=7,
+                                bg="#1e1e1e", fg="#888888",
+                                font=("Courier", self._base_font_size))
+            addr_lbl.pack(side=tk.LEFT, padx=1, pady=1)
+            self._addr_labels.append(addr_lbl)
+            for col in range(self.COLS):
+                byte_idx = addr + col
+                if byte_idx >= self.MAX_BYTES:
+                    break
+                lbl = tk.Label(row_frame, text="--", width=3,
+                               bg="#2d2d2d", fg="#cccccc",
+                               font=("Courier", self._base_font_size), cursor="hand2")
+                lbl.pack(side=tk.LEFT, padx=1, pady=1)
+                lbl.bind("<Button-1>", lambda e, i=byte_idx: self._select(i))
+                self._labels.append(lbl)
+
+    # ── Bit panel ─────────────────────────────────────────────────────────────
+
+    def _build_bit_panel(self) -> None:
+        f = self._bit_frame
+        self._bit_addr_var = tk.StringVar(value="—")
+        self._bit_val_var  = tk.StringVar(value="—")
+
+        ttk.Label(f, text="Byte:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(f, textvariable=self._bit_addr_var,
+                  font=("Courier", 10, "bold")).grid(row=0, column=1, columnspan=3, sticky=tk.W)
+        ttk.Label(f, text="Value:").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+        ttk.Label(f, textvariable=self._bit_val_var,
+                  font=("Courier", 10)).grid(row=1, column=1, columnspan=3, sticky=tk.W, pady=(4, 0))
+
+        ttk.Separator(f, orient=tk.HORIZONTAL).grid(
+            row=2, column=0, columnspan=4, sticky=tk.EW, pady=6)
+
+        for col, text in enumerate(("Bit", "Val", "CC (byte)", "CC (bit)")):
+            ttk.Label(f, text=text, font=("Courier", 9),
+                      foreground="#888888").grid(row=3, column=col, sticky=tk.W, padx=(0, 6))
+
+        self._bit_rows: List[Tuple[tk.Label, tk.Label, tk.Label, tk.Label]] = []
+        for bit_row, bit in enumerate(range(7, -1, -1)):
+            r = 4 + bit_row
+            lbl_bit    = tk.Label(f, text=f"b{bit}", font=("Courier", 9), width=3, anchor=tk.W)
+            lbl_val    = tk.Label(f, text="-",       font=("Courier", 9, "bold"), width=3, anchor=tk.W)
+            lbl_cc_byt = tk.Label(f, text="-",       font=("Courier", 9), width=11, anchor=tk.W)
+            lbl_cc_bit = tk.Label(f, text="-",       font=("Courier", 9), width=11, anchor=tk.W)
+            lbl_bit.grid(   row=r, column=0, sticky=tk.W)
+            lbl_val.grid(   row=r, column=1, sticky=tk.W)
+            lbl_cc_byt.grid(row=r, column=2, sticky=tk.W, padx=(0, 4))
+            lbl_cc_bit.grid(row=r, column=3, sticky=tk.W)
+            self._bit_rows.append((lbl_bit, lbl_val, lbl_cc_byt, lbl_cc_bit))
+
+    # ── Public update API ─────────────────────────────────────────────────────
+
+    def update_byte(self, idx: int, value: int, source: str = "cc") -> None:
+        """Update a single byte by its packet index."""
+        src_filter = self._src_var.get()
+        if src_filter == "CC only"    and source != "cc":     return
+        if src_filter == "SysEx only" and source != "sysex":  return
+        if idx < 0 or idx >= self.MAX_BYTES:
+            return
+        self._data[idx] = value & 0xFF
+        self._changed_at[idx] = time.monotonic()
+        self._refresh_cell(idx)
+        if self._selected_idx == idx:
+            self._update_bit_panel()
+
+    def update_packet(self, data: bytes, source: str = "sysex") -> None:
+        """Update all bytes from a complete raw packet (e.g. decoded SysEx)."""
+        for idx, val in enumerate(data[: self.MAX_BYTES]):
+            if self._data[idx] != val:
+                self.update_byte(idx, val, source)
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _cell_bg(self, idx: int) -> str:
+        if idx == self._selected_idx:
+            return "#1a6b8a"
+        changed = self._changed_at[idx]
+        if changed is None:
+            return "#2d2d2d"
+        age = time.monotonic() - changed
+        if age < 0.15:  return "#b35900"
+        if age < 0.5:   return "#7a3c00"
+        if age < 2.0:   return "#3d1e00"
+        return "#2d2d2d"
+
+    def _refresh_cell(self, idx: int) -> None:
+        if idx >= len(self._labels):
+            return
+        val = self._data[idx]
+        self._labels[idx].configure(text=f"{val:02X}", bg=self._cell_bg(idx))
+
+    def _on_canvas_resize(self, _event) -> None:
+        self._schedule_auto_fit()
+
+    def _schedule_auto_fit(self) -> None:
+        if self._fit_pending:
+            return
+        self._fit_pending = True
+        self._win.after(50, self._auto_fit_zoom)
+
+    def _auto_fit_zoom(self) -> None:
+        self._fit_pending = False
+        if not self._alive or self._grid_canvas is None:
+            return
+        width = self._grid_canvas.winfo_width()
+        if width <= 100:
+            return
+
+        # Choose the largest font size that fits 1 address column + 32 byte columns.
+        best_size = self._base_font_size
+        for size in range(7, 22):
+            f = tkfont.Font(family="Courier", size=size)
+            cell_px = f.measure("000") + 4
+            addr_px = f.measure("0x000") + 8
+            estimated_total = addr_px + self.COLS * cell_px + 8
+            if estimated_total <= width:
+                best_size = size
+            else:
+                break
+
+        self._zoom_var.set(max(0.8, min(2.5, best_size / self._base_font_size)))
+        self._apply_zoom()
+
+    def _apply_zoom(self) -> None:
+        zoom = max(0.8, min(2.5, float(self._zoom_var.get())))
+        font_size = max(7, min(24, int(round(self._base_font_size * zoom))))
+        cell_width = 3 if zoom < 1.8 else 2
+        addr_width = 7 if zoom < 1.8 else 6
+
+        grid_font = ("Courier", font_size)
+        bit_font = ("Courier", max(8, font_size - 1))
+
+        for lbl in self._header_labels:
+            if lbl.cget("text").strip() == "Addr":
+                lbl.configure(font=grid_font, width=addr_width)
+            else:
+                lbl.configure(font=grid_font, width=cell_width)
+        for lbl in self._addr_labels:
+            lbl.configure(font=grid_font, width=addr_width)
+        for lbl in self._labels:
+            lbl.configure(font=grid_font, width=cell_width)
+
+        for row in self._bit_rows:
+            for lbl in row:
+                lbl.configure(font=bit_font)
+
+    def _tick(self) -> None:
+        if not self._alive:
+            return
+        now = time.monotonic()
+        for idx, changed in enumerate(self._changed_at):
+            if changed is not None and (now - changed) < 2.5:
+                self._refresh_cell(idx)
+        self._win.after(100, self._tick)
+
+    def _select(self, idx: int) -> None:
+        old = self._selected_idx
+        self._selected_idx = idx
+        if old is not None:
+            self._refresh_cell(old)
+        self._refresh_cell(idx)
+        self._update_bit_panel()
+
+    def _update_bit_panel(self) -> None:
+        idx = self._selected_idx
+        if idx is None:
+            return
+        val = self._data[idx]
+        base_ch = max(0, self._base_ch_var.get() - 1)  # 0-indexed
+
+        self._bit_addr_var.set(f"0x{idx:03X}  (dec {idx})")
+        self._bit_val_var.set(f"0x{val:02X}  {val:08b}")
+
+        for bit_row, bit in enumerate(range(7, -1, -1)):
+            _, lbl_val, lbl_cc_byt, lbl_cc_bit = self._bit_rows[bit_row]
+            bit_on = (val >> bit) & 1
+            lbl_val.configure(text=str(bit_on),
+                              fg="#4caf50" if bit_on else "#888888")
+
+            # Byte-mode: CC controller = idx % 128, channel offset = idx // 128
+            byt_ch = (base_ch + idx // 128) & 0x0F
+            byt_cc = idx % 128
+            lbl_cc_byt.configure(text=f"ch{byt_ch + 1} cc{byt_cc}")
+
+            # Bit-mode: bit_abs = idx*8 + bit
+            bit_abs = idx * 8 + bit
+            bit_ch  = (base_ch + bit_abs // 128) & 0x0F
+            bit_cc  = bit_abs % 128
+            lbl_cc_bit.configure(text=f"ch{bit_ch + 1} cc{bit_cc}")
+
+        self._info_var.set(
+            f"Byte 0x{idx:03X} (dec {idx}) | 0x{val:02X} | {val:08b}")
+
+    def _clear_highlights(self) -> None:
+        self._changed_at = [None] * self.MAX_BYTES
+        for idx in range(self.MAX_BYTES):
+            self._refresh_cell(idx)
+
+    def _on_close(self) -> None:
+        self._alive = False
+        self._win.destroy()
+
+    def is_alive(self) -> bool:
+        return self._alive
 
 
 @dataclass
@@ -108,6 +425,9 @@ class MidiDevTesterApp:
         self.rule_by_key: Dict[Tuple[str, int, int], List[MappingRule]] = {}
         self.counts: Dict[Tuple[str, int, int], int] = {}
 
+        self._base_channel_var = tk.IntVar(value=1)
+        self._byte_map_win: Optional[ByteMapWindow] = None
+
         self._build_ui()
         self._refresh_ports()
         self._load_demo_rules()
@@ -168,6 +488,7 @@ class MidiDevTesterApp:
         log_buttons = ttk.Frame(left)
         log_buttons.pack(fill=tk.X, pady=(6, 0))
         ttk.Button(log_buttons, text="Clear Log", command=self._clear_log).pack(side=tk.LEFT)
+        ttk.Button(log_buttons, text="Byte Map", command=self._open_byte_map).pack(side=tk.LEFT, padx=(6, 0))
 
         # Counters
         ttk.Label(left, text="Incoming Counters (by key)").pack(anchor=tk.W, pady=(10, 0))
@@ -342,12 +663,15 @@ class MidiDevTesterApp:
         parsed = self._parse_msg(msg)
         if parsed is None:
             self._insert_log(ts, msg.type, "-", "-", "-", str(msg))
+            self._route_sysex_to_byte_map(msg)
             return
 
         in_kind, channel, index, value = parsed
         self._insert_log(ts, in_kind, channel, index, value, str(msg))
         self._bump_counter(in_kind, channel, index)
         self._apply_rules(in_kind, channel, index, value)
+        if in_kind == "cc":
+            self._route_cc_to_byte_map(channel, index, value)
 
     @staticmethod
     def _parse_msg(msg: mido.Message) -> Optional[Tuple[str, int, int, int]]:
@@ -520,6 +844,43 @@ class MidiDevTesterApp:
     def _on_close(self) -> None:
         self.engine.disconnect()
         self.root.destroy()
+
+    # ── Byte Map helpers ──────────────────────────────────────────────────────
+
+    def _open_byte_map(self) -> None:
+        if self._byte_map_win is not None and self._byte_map_win.is_alive():
+            self._byte_map_win._win.lift()
+            return
+        self._byte_map_win = ByteMapWindow(self.root, self._base_channel_var)
+
+    def _route_cc_to_byte_map(self, channel: int, controller: int, value: int) -> None:
+        """Reconstruct byte index from a MIDI CC and push to the byte map."""
+        win = self._byte_map_win
+        if win is None or not win.is_alive():
+            return
+        base_ch = self._base_channel_var.get()  # 1-based
+        ch_offset = (channel - base_ch) & 0x0F  # wraps
+        byte_idx = ch_offset * 128 + controller
+        # value = (raw_byte >> 1) & 0x7F  ⟹  approx raw_byte = value << 1
+        reconstructed = (value & 0x7F) << 1
+        win.update_byte(byte_idx, reconstructed, source="cc")
+
+    def _route_sysex_to_byte_map(self, msg: mido.Message) -> None:
+        """Decode a raw-USB SysEx packet (F0 7D 53 34 02 <nibbles> F7) and push."""
+        win = self._byte_map_win
+        if win is None or not win.is_alive():
+            return
+        if msg.type != "sysex":
+            return
+        data = msg.data  # mido strips F0/F7; data is a tuple of ints
+        # Expected header: 7D 53 34 02
+        if len(data) < 5 or data[0] != 0x7D or data[1] != 0x53 or data[2] != 0x34 or data[3] != 0x02:
+            return
+        nibbles = data[4:]
+        if len(nibbles) % 2 != 0:
+            return
+        raw = bytes((nibbles[i] << 4) | nibbles[i + 1] for i in range(0, len(nibbles), 2))
+        win.update_packet(raw, source="sysex")
 
 
 def main() -> None:

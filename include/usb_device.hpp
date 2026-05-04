@@ -37,6 +37,7 @@ public:
     void open();
     void close();
     bool disconnected() const { return disconnected_; }
+    bool is_open() const { return handle_ != nullptr; }
     vector<uint8_t> read_input() const;
     void write_output(const vector<uint8_t>& payload) const;
     void write_to(uint8_t endpoint, const vector<uint8_t>& payload) const;

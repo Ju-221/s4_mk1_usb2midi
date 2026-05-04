@@ -8,6 +8,22 @@ Heavily inspired by [Opa-/x1-mk1-usb2midi](https://github.com/Opa-/x1-mk1-usb2mi
 
 > **Status: work in progress.** The generic bridge infrastructure is solid. The S4 MK1-specific protocol decoding (mapping, semantic controls, LED feedback) is the remaining gap.
 
+## How the code works
+
+The program runs in one of two modes selected on the command line: `probe` or `bridge`.
+
+**Probe mode** opens the USB device, prints its descriptors, and optionally streams raw byte packets from an input endpoint to stdout. You can also point it at an output endpoint and have it write raw hex payloads — useful for brute-forcing LED state before the protocol is understood. Nothing else happens; no MIDI ports are created.
+
+**Bridge mode** is the main loop. On startup it opens the USB device, calls `s4_mk1_init()` to perform any hardware handshake needed, and then creates two virtual CoreMIDI ports via `CoreMidiBridge`. From that point it runs two concurrent data paths:
+
+- **USB → MIDI (input path).** The main thread reads raw USB HID reports in a tight loop. Each report is handed to `S4GenericProtocol::decode_input()`, which compares it byte-by-byte against the previous report. For every byte that changed, the protocol produces one or more MIDI CC messages — either from an explicit mapping table you fill in, or from a generic fallback that maps each changed byte or bit to a unique CC number so Traktor/Mixxx can learn it. Those CC messages are then sent out on the virtual MIDI output port.
+
+- **MIDI → USB (output/feedback path).** A CoreMIDI callback fires on a background thread whenever an incoming MIDI message arrives on the feedback port (e.g. from Traktor telling an LED to turn on). That message is passed to `S4GenericProtocol::encode_output()`. Currently the only thing it understands is a raw SysEx packet (`F0 7D 53 34 ... F7`), which it writes verbatim to the USB output endpoint. All other MIDI messages are ignored with a one-time warning until the LED protocol is reverse-engineered.
+
+If the USB device disconnects at runtime, the bridge detects it, prints a message, and retries the open + init sequence every second until the device comes back — without crashing or requiring a restart.
+
+The `running` flag is a global `atomic_bool` set to `false` by SIGINT/SIGTERM (`Ctrl-C`), which causes both loops to exit cleanly.
+
 ### What works now
 
 - Talks to any USB HID/bulk device via `libusb`

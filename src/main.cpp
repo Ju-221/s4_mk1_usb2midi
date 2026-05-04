@@ -32,6 +32,7 @@ enum class Mode {
 struct AppOptions {
     Mode mode = Mode::Probe;
     bool stream = false;
+    bool raw_sysex = false;
     UsbOptions usb;
     uint8_t midi_base_channel = 0;
     uint8_t input_deadzone = 0;
@@ -201,7 +202,7 @@ vector<uint8_t> parse_hex_bytes(const string& text) {
 void print_usage() {
     cout << "Usage:\n"
          << "  s4_mk1_usb2midi probe --vid <id> --pid <id> [--interface N --in-ep EP --report-size N --stream] [--out-ep EP --write-hex \"aa bb cc\" --write-repeat N --write-interval-ms N]\n"
-         << "  s4_mk1_usb2midi bridge --vid <id> --pid <id> --interface N --in-ep EP --report-size N [--out-ep EP] [--alt-setting N] [--midi-channel 1-16] [--input-deadzone 0-127] [--input-decode byte|bit|hybrid] [--input-debug] [--input-debug-buttons]\n";
+            << "  s4_mk1_usb2midi bridge --vid <id> --pid <id> --interface N --in-ep EP --report-size N [--out-ep EP] [--alt-setting N] [--midi-channel 1-16] [--input-deadzone 0-127] [--input-decode byte|bit|hybrid] [--input-debug] [--input-debug-buttons] [--raw-sysex]\n";
 }
 
 AppOptions parse_args(int argc, char** argv) {
@@ -279,6 +280,8 @@ AppOptions parse_args(int argc, char** argv) {
         } else if (flag == "--input-debug-buttons") {
             options.input_debug = true;
             options.input_debug_buttons_only = true;
+        } else if (flag == "--raw-sysex") {
+            options.raw_sysex = true;
         } else {
             throw runtime_error("Unknown flag: " + flag);
         }
@@ -375,15 +378,20 @@ int run_bridge(const AppOptions& options) {
 
     CoreMidiBridge midi("S4 MK1 USB2MIDI", "S4 MK1 USB2MIDI Feedback",
                         [&](const vector<uint8_t>& message) {
-                            if (device.disconnected()) return;
+                            if (device.disconnected() || !device.is_open()) return;
                             const auto payload = protocol.encode_output(message);
                             if (!payload.has_value()) return;
-                            device.write_output(*payload);
+                            try {
+                                device.write_output(*payload);
+                            } catch (const exception&) {
+                                // Device closed concurrently; main loop will handle reconnect
+                            }
                         });
 
     cout << "Running bridge with protocol: " << protocol.name() << endl;
 
     vector<uint8_t> previous_debug_packet;
+    vector<uint8_t> previous_raw_sysex_packet;
 
     while (running) {
         const auto packet = device.read_input();
@@ -400,6 +408,29 @@ int run_bridge(const AppOptions& options) {
                 print_input_deltas(previous_debug_packet, packet, options.input_debug_buttons_only);
             }
             previous_debug_packet = packet;
+        }
+        if (options.raw_sysex && packet != previous_raw_sysex_packet) {
+            // Encode the raw USB packet as SysEx using nibble pairs so all
+            // bytes stay < 0x80 (MIDI data byte constraint).
+            // Format: F0 7D 53 34 02 <hi_nibble lo_nibble ...> F7
+            vector<uint8_t> sysex;
+            sysex.reserve(5 + packet.size() * 2 + 1);
+            sysex.push_back(0xF0);
+            sysex.push_back(0x7D); // NI manufacturer byte
+            sysex.push_back(0x53); // 'S'
+            sysex.push_back(0x34); // '4'
+            sysex.push_back(0x02); // type: raw USB in (0x01 = LED out)
+            for (const uint8_t b : packet) {
+                sysex.push_back(static_cast<uint8_t>((b >> 4) & 0x0F));
+                sysex.push_back(static_cast<uint8_t>(b & 0x0F));
+            }
+            sysex.push_back(0xF7);
+            try {
+                midi.send(sysex);
+                previous_raw_sysex_packet = packet;
+            } catch (const exception& e) {
+                cerr << "[raw-sysex] Failed to publish packet: " << e.what() << endl;
+            }
         }
         for (const auto& message : protocol.decode_input(packet)) {
             midi.send(message.bytes);

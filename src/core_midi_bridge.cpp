@@ -3,8 +3,10 @@
 #include <CoreFoundation/CoreFoundation.h>
 
 #include <array>
+#include <cstddef>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 using namespace std;
 
@@ -65,7 +67,10 @@ void CoreMidiBridge::send(const vector<uint8_t>& message) const {
         }
     }
 
-    array<uint8_t, 1024> buffer{};
+    // Size packet storage dynamically so large SysEx payloads do not overflow.
+    const size_t packet_list_size =
+        offsetof(MIDIPacketList, packet) + offsetof(MIDIPacket, data) + sanitized.size();
+    vector<uint8_t> buffer(packet_list_size);
     MIDIPacketList* packet_list = reinterpret_cast<MIDIPacketList*>(buffer.data());
     MIDIPacket* packet = MIDIPacketListInit(packet_list);
     packet = MIDIPacketListAdd(packet_list, buffer.size(), packet, 0, sanitized.size(), sanitized.data());
@@ -80,13 +85,19 @@ void CoreMidiBridge::send(const vector<uint8_t>& message) const {
 
 void CoreMidiBridge::read_proc(const MIDIPacketList* packet_list, void* read_proc_ref_con, void*) {
     auto* self = static_cast<CoreMidiBridge*>(read_proc_ref_con);
-    if (self == nullptr || !self->callback_) {
+    if (self == nullptr || !self->callback_ || packet_list == nullptr || packet_list->numPackets == 0) {
         return;
     }
 
-    const MIDIPacket* packet = &packet_list->packet[0];
-    for (uint32_t index = 0; index < packet_list->numPackets; ++index) {
-        self->callback_({packet->data, packet->data + packet->length});
-        packet = MIDIPacketNext(packet);
+    try {
+        const MIDIPacket* packet = &packet_list->packet[0];
+        for (uint32_t index = 0; index < packet_list->numPackets; ++index) {
+            self->callback_({packet->data, packet->data + packet->length});
+            packet = MIDIPacketNext(packet);
+        }
+    } catch (const exception& error) {
+        cerr << "[midi] read callback exception: " << error.what() << endl;
+    } catch (...) {
+        cerr << "[midi] read callback unknown exception" << endl;
     }
 }

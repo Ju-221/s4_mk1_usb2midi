@@ -12,9 +12,7 @@ static constexpr uint8_t EP_CMD  = 0x01; // bulk OUT – command channel
 static constexpr uint8_t EP_RESP = 0x81; // bulk IN  – command response channel
 static constexpr uint8_t EP_LED  = 0x08; // bulk OUT – LED state channel
 
-// ---------------------------------------------------------------------------
-// Async transfer helper state
-// ---------------------------------------------------------------------------
+// Async transfer helper state and callback for cmd() and led_async()
 struct XferState {
     bool done = false;
     int status = 0;
@@ -22,6 +20,9 @@ struct XferState {
 };
 
 static void LIBUSB_CALL xfer_cb(libusb_transfer* t) {
+    if (t == nullptr || t->user_data == nullptr) {
+        return;
+    }
     auto* s = static_cast<XferState*>(t->user_data);
     s->status = t->status;
     s->transferred = t->actual_length;
@@ -93,10 +94,9 @@ static void cmd(UsbDevice& dev, initializer_list<uint8_t> bytes) {
     }
 }
 
-// ---------------------------------------------------------------------------
+
 // Rolling drain of ep 0x84 (sensor IN) – keeps the device's TX buffer from
 // filling up while we write to the LED endpoint on a separate thread path.
-// ---------------------------------------------------------------------------
 static constexpr uint8_t EP_DATA = 0x84;
 
 struct Drain84 {
@@ -110,6 +110,9 @@ struct Drain84 {
 static Drain84 s_drain;
 
 static void LIBUSB_CALL drain84_cb(libusb_transfer* t) {
+    if (t == nullptr || t->user_data == nullptr) {
+        return;
+    }
     auto* d = static_cast<Drain84*>(t->user_data);
     if (t->status == LIBUSB_TRANSFER_CANCELLED ||
         t->status == LIBUSB_TRANSFER_NO_DEVICE ||
@@ -149,10 +152,8 @@ static void stop_drain84() {
     s_drain.active = false;
 }
 
-// ---------------------------------------------------------------------------
 // led_async() – async bulk write to EP_LED, drives the same event loop as
 // cmd() so pending drain reads are processed concurrently.
-// ---------------------------------------------------------------------------
 static void led_async(UsbDevice& dev, const uint8_t* data, int len) {
     libusb_context*       ctx = dev.context();
     libusb_device_handle* hdl = dev.handle();
@@ -196,10 +197,8 @@ static void led_async(UsbDevice& dev, const uint8_t* data, int len) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // LED state dumps (each packet is exactly 32 bytes, (index, value) pairs;
 // the sequence ends with 0xff 0xaa padding)
-// ---------------------------------------------------------------------------
 
 // Group A – all LEDs off (reset state), 11 × 32-byte packets
 static const uint8_t LED_DUMP_A[11][32] = {
