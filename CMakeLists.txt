@@ -18,6 +18,7 @@ add_executable(s4_mk1_usb2midi
     src/usb_device.cpp
     src/core_midi_bridge.cpp
     src/s4_generic_protocol.cpp
+    src/s4_init.cpp
 )
 
 target_include_directories(s4_mk1_usb2midi PRIVATE include)
@@ -45,7 +46,7 @@ add_custom_target(lint
 enable_testing()
 
 add_executable(test_s4_generic_protocol
-    tests/test_s4_generic_protocol.cpp
+    tools/tests/test_s4_generic_protocol.cpp
     src/s4_generic_protocol.cpp
 )
 
