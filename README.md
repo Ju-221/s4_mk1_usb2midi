@@ -64,7 +64,6 @@ cmake --build build
 
 The binary lands at `bin/s4_mk1_usb2midi` (also copied to `build/`).
 
-## Lint And Tests
 
 ## Lint and Tests
 
